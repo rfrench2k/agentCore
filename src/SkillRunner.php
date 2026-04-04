@@ -80,11 +80,13 @@ class SkillRunner
             . ' --max-turns ' . (int)$maxTurns
             . ' --max-budget-usd ' . number_format((float)$budget, 2, '.', '')
             . ' --output-format json'
+            . ' --dangerously-skip-permissions'
             . ' --append-system-prompt-file ' . escapeshellarg($this->normalizePath($skillFile));
 
-        if ($projectRoot && is_dir($projectRoot)) {
-            $cmd .= ' --add-dir ' . escapeshellarg($this->normalizePath($projectRoot));
-        }
+        // Note: intentionally NOT using --add-dir. Skills should access only
+        // what they need via explicit paths or commands in their SKILL.md.
+        // --add-dir causes Claude to explore the project directory, consuming
+        // hundreds of thousands of cache tokens per run.
 
         // Append learnings as additional system prompt if they exist
         if ($learningsContext !== '') {
@@ -93,7 +95,10 @@ class SkillRunner
             $cmd .= ' --append-system-prompt-file ' . escapeshellarg($this->normalizePath($tempFile));
         }
 
-        $cmd .= ' ' . escapeshellarg($prompt);
+        // NOTE: prompt is passed via stdin, not as a command-line argument.
+        // On Windows, passing long quoted strings through proc_open can trigger
+        // cmd.exe argument parsing bugs (especially with backslash-containing paths).
+        // stdin avoids all quoting issues.
 
         $this->logger->info("Running skill: {$skillName}", [
             'model' => $model,
@@ -103,7 +108,7 @@ class SkillRunner
 
         // Execute
         $startTime = microtime(true);
-        $result = $this->execute($cmd);
+        $result = $this->execute($cmd, $prompt);
         $duration = (int)(microtime(true) - $startTime);
 
         // Clean up temp file
@@ -112,26 +117,48 @@ class SkillRunner
         }
 
         // Parse output
-        $output = $result['stdout'];
+        $rawOutput = $result['stdout'];
+        $output = $rawOutput;
         $sessionId = null;
         $budgetUsed = null;
+        $errorDetail = null;
+        $isError = false;
 
         // Try to parse JSON output
-        $jsonOutput = json_decode($output, true);
+        $jsonOutput = json_decode($rawOutput, true);
         if ($jsonOutput !== null) {
-            $output = $jsonOutput['result'] ?? $output;
+            $output = $jsonOutput['result'] ?? $rawOutput;
             $sessionId = $jsonOutput['session_id'] ?? null;
-            if (isset($jsonOutput['usage']['cost_usd'])) {
-                $budgetUsed = (float)$jsonOutput['usage']['cost_usd'];
+
+            // total_cost_usd is the correct field (not usage.cost_usd)
+            if (isset($jsonOutput['total_cost_usd'])) {
+                $budgetUsed = (float)$jsonOutput['total_cost_usd'];
+            }
+
+            // Detect error conditions from JSON
+            $isError = ($jsonOutput['is_error'] ?? false) === true;
+            if ($isError) {
+                $subtype = $jsonOutput['subtype'] ?? 'error';
+                $errors = $jsonOutput['errors'] ?? [];
+                $errorDetail = $subtype;
+                if (!empty($errors)) {
+                    $errorDetail .= ': ' . implode('; ', (array)$errors);
+                }
+                if ($subtype === 'error_max_turns') {
+                    $numTurns = $jsonOutput['num_turns'] ?? '?';
+                    $errorDetail = "Hit max turns ({$numTurns}). Increase max_turns in skill_schedules.";
+                }
             }
         }
 
-        $success = $result['exit_code'] === 0;
+        // Skill succeeded if exit code is 0 AND JSON doesn't indicate error
+        $success = ($result['exit_code'] === 0) && !$isError;
 
         if (!$success) {
+            $finalError = $errorDetail ?: ($result['stderr'] ?: 'Unknown error (exit code ' . $result['exit_code'] . ')');
             $this->logger->error("Skill failed: {$skillName}", [
                 'exit_code' => $result['exit_code'],
-                'stderr' => substr($result['stderr'], 0, 500),
+                'error' => $finalError,
             ]);
         } else {
             $this->logger->info("Skill completed: {$skillName}", [
@@ -143,7 +170,7 @@ class SkillRunner
         return new SkillRunResult(
             success: $success,
             output: $output,
-            error: $success ? null : ($result['stderr'] ?: 'Unknown error'),
+            error: $success ? null : ($errorDetail ?: ($result['stderr'] ?: 'Unknown error')),
             duration: $duration,
             sessionId: $sessionId,
             budgetUsed: $budgetUsed,
@@ -232,8 +259,11 @@ class SkillRunner
 
     /**
      * Execute a shell command and capture output.
+     *
+     * @param string $cmd    The command to run
+     * @param string $stdin  Optional data to write to the process's stdin
      */
-    private function execute(string $cmd): array
+    private function execute(string $cmd, string $stdin = ''): array
     {
         $descriptors = [
             0 => ['pipe', 'r'],  // stdin
@@ -241,14 +271,18 @@ class SkillRunner
             2 => ['pipe', 'w'],  // stderr
         ];
 
-        $this->logger->debug("Executing: {$cmd}");
+        $this->logger->debug("Executing: {$cmd}" . ($stdin ? " [stdin: " . substr($stdin, 0, 80) . "]" : ''));
 
         $process = proc_open($cmd, $descriptors, $pipes);
         if (!is_resource($process)) {
             return ['stdout' => '', 'stderr' => 'Failed to start process', 'exit_code' => 1];
         }
 
-        fclose($pipes[0]); // Close stdin
+        // Write prompt to stdin if provided
+        if ($stdin !== '') {
+            fwrite($pipes[0], $stdin);
+        }
+        fclose($pipes[0]);
 
         $stdout = stream_get_contents($pipes[1]);
         $stderr = stream_get_contents($pipes[2]);
