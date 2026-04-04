@@ -1,0 +1,44 @@
+<?php
+/**
+ * AgentCore — Local Configuration Overrides
+ *
+ * Copy this file to config.local.php and fill in your values.
+ * This file is gitignored — your credentials stay local.
+ *
+ * Any key here overrides the matching key in config.defaults.php.
+ * You only need to include keys you want to change.
+ */
+
+return [
+    'db' => [
+        'user' => 'your_mysql_user',
+        'pass' => 'your_mysql_password',
+        // 'name' => 'agentcore',   // default is fine for most setups
+        // 'host' => '127.0.0.1',
+        // 'port' => 3306,
+    ],
+
+    'paths' => [
+        // Point these to your project's directories
+        'skills'       => '/path/to/your/project/skills',
+        'memory'       => '/path/to/your/project/memory',
+        'status'       => '/path/to/your/project/STATUS.md',
+        'persona'      => '/path/to/your/project/persona.md',
+        'claude_md'    => '/path/to/your/project/CLAUDE.md',
+        'project_root' => '/path/to/your/project',
+    ],
+
+    // 'claude' => [
+    //     'binary'        => 'claude',              // path to claude CLI
+    //     'default_model' => 'sonnet',              // haiku, sonnet, or opus
+    //     'mysql_client'  => 'mysql',               // path to mysql client
+    // ],
+
+    // 'telegram' => [
+    //     'bot_token'        => 'your-bot-token',
+    //     'allowed_chat_ids' => '123456789',        // comma-separated chat IDs
+    //     'session_timeout'  => 1800,               // 30 min idle timeout
+    // ],
+
+    'timezone' => 'America/Los_Angeles',
+];
