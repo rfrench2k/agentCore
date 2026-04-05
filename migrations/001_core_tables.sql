@@ -6,6 +6,7 @@
 CREATE TABLE IF NOT EXISTS skill_schedules (
   id INT AUTO_INCREMENT PRIMARY KEY,
   skill_name VARCHAR(100) NOT NULL UNIQUE,
+  exec_command TEXT NULL,            -- for exec:* rows that run a shell command instead of a skill
   cron_expression VARCHAR(50) NOT NULL,
   timezone VARCHAR(50) NOT NULL DEFAULT 'America/Los_Angeles',
   model VARCHAR(50) DEFAULT 'sonnet',

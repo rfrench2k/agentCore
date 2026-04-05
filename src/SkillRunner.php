@@ -74,11 +74,12 @@ class SkillRunner
         $claudeBin = $this->core->claudeBinary();
         $projectRoot = $this->core->projectRoot();
 
+        // Build command. No --max-budget-usd — Ross is on Claude Code subscription,
+        // not API billing. --max-turns is the real runaway guard.
         $cmd = $claudeBin
             . ' -p'
             . ' --model ' . escapeshellarg($model)
             . ' --max-turns ' . (int)$maxTurns
-            . ' --max-budget-usd ' . number_format((float)$budget, 2, '.', '')
             . ' --output-format json'
             . ' --dangerously-skip-permissions'
             . ' --append-system-prompt-file ' . escapeshellarg($this->normalizePath($skillFile));
@@ -123,6 +124,11 @@ class SkillRunner
         $budgetUsed = null;
         $errorDetail = null;
         $isError = false;
+        $tokensIn = 0;
+        $tokensOut = 0;
+        $cacheRead = 0;
+        $cacheWrite = 0;
+        $modelUsed = $model;
 
         // Try to parse JSON output
         $jsonOutput = json_decode($rawOutput, true);
@@ -133,6 +139,23 @@ class SkillRunner
             // total_cost_usd is the correct field (not usage.cost_usd)
             if (isset($jsonOutput['total_cost_usd'])) {
                 $budgetUsed = (float)$jsonOutput['total_cost_usd'];
+            }
+
+            // Token usage for usage_log
+            if (isset($jsonOutput['usage'])) {
+                $u = $jsonOutput['usage'];
+                $tokensIn  = (int)($u['input_tokens'] ?? 0);
+                $tokensOut = (int)($u['output_tokens'] ?? 0);
+                $cacheRead  = (int)($u['cache_read_input_tokens'] ?? 0);
+                $cacheWrite = (int)($u['cache_creation_input_tokens'] ?? 0);
+            }
+
+            // Actual model used (from modelUsage map)
+            if (isset($jsonOutput['modelUsage']) && is_array($jsonOutput['modelUsage'])) {
+                $firstKey = array_key_first($jsonOutput['modelUsage']);
+                if ($firstKey) {
+                    $modelUsed = $firstKey;
+                }
             }
 
             // Detect error conditions from JSON
@@ -174,7 +197,11 @@ class SkillRunner
             duration: $duration,
             sessionId: $sessionId,
             budgetUsed: $budgetUsed,
-            model: $model
+            model: $modelUsed,
+            tokensIn: $tokensIn,
+            tokensOut: $tokensOut,
+            cacheRead: $cacheRead,
+            cacheWrite: $cacheWrite,
         );
     }
 
@@ -271,9 +298,15 @@ class SkillRunner
             2 => ['pipe', 'w'],  // stderr
         ];
 
-        $this->logger->debug("Executing: {$cmd}" . ($stdin ? " [stdin: " . substr($stdin, 0, 80) . "]" : ''));
+        // Set CWD to project_root (skoopix) so Claude Code auto-loads CLAUDE.md
+        $cwd = $this->core->projectRoot();
+        if ($cwd && !is_dir($cwd)) {
+            $cwd = null;
+        }
 
-        $process = proc_open($cmd, $descriptors, $pipes);
+        $this->logger->debug("Executing: {$cmd}" . ($stdin ? " [stdin: " . substr($stdin, 0, 80) . "]" : '') . ($cwd ? " [cwd: $cwd]" : ''));
+
+        $process = proc_open($cmd, $descriptors, $pipes, $cwd);
         if (!is_resource($process)) {
             return ['stdout' => '', 'stderr' => 'Failed to start process', 'exit_code' => 1];
         }
@@ -312,6 +345,10 @@ class SkillRunResult
         public readonly ?string $sessionId = null,
         public readonly ?float $budgetUsed = null,
         public readonly ?string $model = null,
+        public readonly int $tokensIn = 0,
+        public readonly int $tokensOut = 0,
+        public readonly int $cacheRead = 0,
+        public readonly int $cacheWrite = 0,
     ) {}
 
     public function summary(int $maxLength = 200): string

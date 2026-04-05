@@ -55,11 +55,96 @@ class Scheduler
         $ran = 0;
 
         foreach ($dueSkills as $schedule) {
-            $this->runSkill($schedule);
+            // exec:<path-to-script> schedules run a direct command instead of claude -p
+            if (str_starts_with($schedule['skill_name'], 'exec:')) {
+                $this->runExec($schedule);
+            } else {
+                $this->runSkill($schedule);
+            }
             $ran++;
         }
 
         return $ran;
+    }
+
+    /**
+     * Run a direct exec schedule (e.g. Node scripts like eme-health-check.js).
+     * skill_name holds a short identifier like 'exec:eme-health-check'.
+     * exec_command holds the actual shell command to run.
+     */
+    private function runExec(array $schedule): void
+    {
+        $execCommand = $schedule['exec_command'] ?? '';
+        if (!$execCommand) {
+            $this->logger->error("Exec schedule {$schedule['skill_name']} has no exec_command set");
+            return;
+        }
+        $this->logger->info("Running exec schedule: {$schedule['skill_name']}");
+
+        $runId = $this->insertRun($schedule['skill_name'], $schedule['id'], 'schedule');
+        $startTime = microtime(true);
+
+        $descriptors = [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ];
+
+        $cwd = $this->core->projectRoot();
+        if ($cwd && !is_dir($cwd)) $cwd = null;
+
+        $process = proc_open($execCommand, $descriptors, $pipes, $cwd);
+        if (!is_resource($process)) {
+            $this->logger->error("Failed to start exec: {$execCommand}");
+            return;
+        }
+
+        fclose($pipes[0]);
+        $stdout = stream_get_contents($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exitCode = proc_close($process);
+        $duration = (int)(microtime(true) - $startTime);
+
+        $success = $exitCode === 0;
+        $status = $success ? 'completed' : 'failed';
+
+        // Update skill_runs row
+        $this->db->prepare("
+            UPDATE skill_runs
+            SET status = ?, completed_at = NOW(), duration_seconds = ?,
+                output_summary = ?, output_full = ?, error_message = ?
+            WHERE id = ?
+        ")->execute([
+            $status,
+            $duration,
+            substr($stdout, 0, 500),
+            $stdout,
+            $success ? null : $stderr,
+            $runId,
+        ]);
+
+        // Calculate next run + update schedule
+        $tz = $schedule['timezone'] ?: $this->core->config('timezone');
+        $cron = new CronExpression($schedule['cron_expression']);
+        $nextRun = $cron->nextRunAfter(new DateTime('now', new DateTimeZone($tz)));
+
+        if ($success) {
+            $this->db->prepare("
+                UPDATE skill_schedules
+                SET last_run_at = NOW(), next_run_at = ?, consecutive_failures = 0
+                WHERE id = ?
+            ")->execute([$nextRun->format('Y-m-d H:i:s'), $schedule['id']]);
+        } else {
+            $failures = $schedule['consecutive_failures'] + 1;
+            $this->db->prepare("
+                UPDATE skill_schedules
+                SET last_run_at = NOW(), next_run_at = ?, consecutive_failures = ?
+                WHERE id = ?
+            ")->execute([$nextRun->format('Y-m-d H:i:s'), $failures, $schedule['id']]);
+            $this->logger->error("Exec failed ({$failures} consecutive): {$execCommand}\n{$stderr}");
+        }
     }
 
     /**
@@ -90,6 +175,9 @@ class Scheduler
 
         // Update run record
         $this->updateRun($runId, $result);
+
+        // Write cost to usage_log (assistant DB)
+        $this->writeUsageLog($skillName, $result, $triggerType);
 
         return $result;
     }
@@ -165,6 +253,9 @@ class Scheduler
         // Update run record
         $this->updateRun($runId, $result);
 
+        // Write cost to usage_log (assistant DB)
+        $this->writeUsageLog($skillName, $result, 'schedule');
+
         // Calculate next run
         $tz = $schedule['timezone'] ?: $this->core->config('timezone');
         $cron = new CronExpression($schedule['cron_expression']);
@@ -229,6 +320,65 @@ class Scheduler
             $result->model,
             $runId,
         ]);
+    }
+
+    /**
+     * Write a row to assistant.usage_log for cost tracking.
+     * The usage_log table is in the user's application DB (not agentcore's).
+     */
+    private function writeUsageLog(string $skillName, SkillRunResult $result, string $triggerType): void
+    {
+        // Only log if we got real usage data from claude -p JSON output
+        if ($result->tokensIn === 0 && $result->tokensOut === 0 && $result->budgetUsed === null) {
+            return;
+        }
+
+        try {
+            // Connect to assistant DB using the same MySQL user as agentcore
+            // (the sysdba user has access to both databases on Ross's setup)
+            $c = $this->core->config('db');
+            $dsn = "mysql:host={$c['host']};port={$c['port']};dbname=assistant;charset=utf8mb4";
+            $aDb = new \PDO($dsn, $c['user'], $c['pass'], [
+                \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+            ]);
+
+            $taskType = match($triggerType) {
+                'schedule'  => 'cron_skill',
+                'telegram'  => 'telegram_chat',
+                'web'       => 'web_skill',
+                'cli'       => 'cli_skill',
+                default     => 'skill',
+            };
+
+            $description = "Skill: {$skillName}";
+            if ($result->success) {
+                $summary = trim(preg_replace('/\s+/', ' ', $result->output));
+                if (strlen($summary) > 5) {
+                    $description .= ' — ' . substr($summary, 0, 180);
+                }
+            }
+
+            $stmt = $aDb->prepare("
+                INSERT INTO usage_log
+                    (timestamp, provider, model, task_type, cron_job_name, description,
+                     tokens_in, tokens_out, cache_read, cache_write, cost_usd, session_id)
+                VALUES (NOW(), 'anthropic', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ");
+            $stmt->execute([
+                $result->model,
+                $taskType,
+                $skillName,
+                $description,
+                $result->tokensIn,
+                $result->tokensOut,
+                $result->cacheRead,
+                $result->cacheWrite,
+                $result->budgetUsed,
+                $result->sessionId,
+            ]);
+        } catch (\Throwable $e) {
+            $this->logger->warn("Failed to write usage_log: " . $e->getMessage());
+        }
     }
 
     private function sendAlert(string $skillName, SkillRunResult $result, int $failures, bool $disabled): void
