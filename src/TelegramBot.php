@@ -16,6 +16,7 @@ require_once __DIR__ . '/CronExpression.php';
 require_once __DIR__ . '/Scheduler.php';
 require_once __DIR__ . '/TelegramApi.php';
 require_once __DIR__ . '/Logger.php';
+require_once __DIR__ . '/MemoryManager.php';
 
 class TelegramBot
 {
@@ -24,6 +25,7 @@ class TelegramBot
     private TelegramApi $api;
     private Scheduler $scheduler;
     private SkillRunner $runner;
+    private MemoryManager $memory;
     private Logger $logger;
     private array $allowedChatIds;
     private int $sessionTimeout;
@@ -44,6 +46,7 @@ class TelegramBot
         $this->api = new TelegramApi($token);
         $this->scheduler = new Scheduler($this->core);
         $this->runner = new SkillRunner($this->core);
+        $this->memory = new MemoryManager($this->core);
         $this->sessionTimeout = $this->core->config('telegram.session_timeout') ?: 1800;
 
         $chatIds = $this->core->config('telegram.allowed_chat_ids') ?: '';
@@ -51,7 +54,60 @@ class TelegramBot
     }
 
     /**
-     * Main bot loop. Runs forever.
+     * Source files whose mtime the bot watches. If any of these change after startup,
+     * the bot exits cleanly at the next poll boundary so the .bat wrapper loop can
+     * relaunch PHP and pick up the new code. No manual restart required when I push
+     * a code change.
+     */
+    private function reloadWatchFiles(): array
+    {
+        $srcDir = __DIR__;
+        return [
+            $srcDir . '/TelegramBot.php',
+            $srcDir . '/TelegramApi.php',
+            $srcDir . '/MemoryManager.php',
+            $srcDir . '/SkillRunner.php',
+            $srcDir . '/Scheduler.php',
+            $srcDir . '/CronExpression.php',
+            $srcDir . '/AgentCore.php',
+            $srcDir . '/Logger.php',
+            dirname($srcDir) . '/config/config.local.php',
+            dirname($srcDir) . '/config/config.defaults.php',
+            dirname($srcDir) . '/config/config.php',
+        ];
+    }
+
+    /**
+     * Snapshot mtimes of the watched files at startup. Returns file → mtime map.
+     */
+    private function snapshotSourceMtimes(): array
+    {
+        $snap = [];
+        foreach ($this->reloadWatchFiles() as $file) {
+            if (file_exists($file)) {
+                $snap[$file] = filemtime($file);
+            }
+        }
+        return $snap;
+    }
+
+    /**
+     * Returns the first file whose mtime has changed since the snapshot, or null.
+     */
+    private function detectSourceChange(array $snapshot): ?string
+    {
+        foreach ($snapshot as $file => $mtime) {
+            if (!file_exists($file)) continue;
+            $now = filemtime($file);
+            if ($now !== false && $now > $mtime) {
+                return $file;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Main bot loop. Runs forever — or until source files change and we self-restart.
      */
     public function run(): void
     {
@@ -67,11 +123,22 @@ class TelegramBot
         echo "AgentCore Telegram bot started: @{$botName}\n";
         echo "Listening for messages... (Ctrl+C to stop)\n";
 
+        $sourceSnapshot = $this->snapshotSourceMtimes();
+
         while (true) {
             try {
                 $this->expireSessions();
                 $this->pollAndProcess();
                 $this->errorBackoff = 1;
+
+                // Hot-reload: if any source file changed since startup, exit cleanly.
+                // The .bat wrapper's :loop will restart PHP and pick up the new code.
+                $changed = $this->detectSourceChange($sourceSnapshot);
+                if ($changed !== null) {
+                    $this->logger->info("Source changed, exiting for reload", ['file' => basename($changed)]);
+                    echo "Source file changed (" . basename($changed) . "), exiting for reload...\n";
+                    exit(0);
+                }
             } catch (Throwable $e) {
                 $this->logger->error("Bot error: {$e->getMessage()}");
                 echo "Error: {$e->getMessage()}\n";
@@ -346,75 +413,62 @@ class TelegramBot
         $session = $stmt->fetch();
 
         $claudeBin = $this->core->claudeBinary();
-        $projectRoot = $this->core->projectRoot();
-        $personaFile = $this->core->config('paths.persona');
-        $statusFile = $this->core->config('paths.status');
-        $claudeMd = $this->core->config('paths.claude_md');
 
         if ($session) {
-            // Continue existing session
+            // Continue existing session — no need to re-inject system prompt, Claude remembers.
             $cmd = $claudeBin . ' -p'
                 . ' --resume ' . escapeshellarg($session['session_id'])
-                . ' --max-turns 5'
-                . ' --max-budget-usd 1.00'
+                . ' --max-turns 8'
                 . ' --output-format json'
-                . ' ' . escapeshellarg($text);
+                . ' --dangerously-skip-permissions';
 
-            $result = $this->executeCommand($cmd);
+            $result = $this->execute($cmd, $text);
 
-            // Update session
-            $this->db->prepare("
-                UPDATE telegram_sessions
-                SET last_message_at = NOW(), message_count = message_count + 1
-                WHERE id = ?
-            ")->execute([$session['id']]);
-        } else {
-            // Start new session
+            // Self-heal: if resume failed because the session is stale/invalid, expire it
+            // and drop through to the new-session path so the user isn't wedged.
+            if ($this->looksLikeSessionFailure($result)) {
+                $this->logger->warn("Resume failed for session {$session['session_id']}; expiring and starting fresh");
+                $this->db->prepare("UPDATE telegram_sessions SET status = 'expired' WHERE id = ?")
+                    ->execute([$session['id']]);
+                $session = null;
+            } else {
+                $this->db->prepare("
+                    UPDATE telegram_sessions
+                    SET last_message_at = NOW(), message_count = message_count + 1
+                    WHERE id = ?
+                ")->execute([$session['id']]);
+            }
+        }
+
+        if (!$session) {
+            // Start new session — build full system prompt with persona, user info, memory, status, capture reflex.
             $sessionId = $this->generateSessionId();
-
-            // Build system prompt additions
-            $systemPrompt = '';
-            if ($personaFile && file_exists($personaFile)) {
-                $systemPrompt .= file_get_contents($personaFile) . "\n\n";
-            }
-            if ($statusFile && file_exists($statusFile)) {
-                $systemPrompt .= "## Current Status\n\n" . file_get_contents($statusFile) . "\n\n";
-            }
+            $systemPromptFile = $this->buildSystemPromptFile($chatId);
 
             $cmd = $claudeBin . ' -p'
                 . ' --model ' . escapeshellarg($this->core->defaultModel())
-                . ' --max-turns 5'
-                . ' --max-budget-usd 1.00'
+                . ' --max-turns 8'
                 . ' --session-id ' . escapeshellarg($sessionId)
-                . ' --output-format json';
+                . ' --output-format json'
+                . ' --dangerously-skip-permissions';
 
-            if ($projectRoot && is_dir($projectRoot)) {
-                $cmd .= ' --add-dir ' . escapeshellarg($projectRoot);
+            if ($systemPromptFile) {
+                $cmd .= ' --append-system-prompt-file ' . escapeshellarg($systemPromptFile);
             }
 
-            if ($systemPrompt) {
-                $tempFile = sys_get_temp_dir() . '/agentcore-persona-' . $chatId . '.md';
-                file_put_contents($tempFile, $systemPrompt);
-                $cmd .= ' --append-system-prompt-file ' . escapeshellarg($tempFile);
+            $result = $this->execute($cmd, $text);
+
+            if ($systemPromptFile && file_exists($systemPromptFile)) {
+                unlink($systemPromptFile);
             }
 
-            $cmd .= ' ' . escapeshellarg($text);
-
-            $result = $this->executeCommand($cmd);
-
-            // Clean up temp file
-            if (isset($tempFile) && file_exists($tempFile)) {
-                unlink($tempFile);
-            }
-
-            // Save session
             $this->db->prepare("
                 INSERT INTO telegram_sessions (chat_id, session_id, status)
                 VALUES (?, ?, 'active')
             ")->execute([$chatId, $sessionId]);
         }
 
-        // Parse and send response
+        // Parse JSON response
         $output = $result['stdout'];
         $jsonOutput = json_decode($output, true);
         $responseText = $jsonOutput['result'] ?? $output;
@@ -423,7 +477,202 @@ class TelegramBot
             $responseText = $result['stderr'] ? "Error: " . substr($result['stderr'], 0, 500) : "No response.";
         }
 
+        // Extract any [CAPTURE]...[/CAPTURE] blocks → write to STATUS.md, strip from reply.
+        $responseText = $this->extractCaptures($responseText);
+
         $this->api->sendMessage($chatId, $responseText);
+    }
+
+    /**
+     * Detect errors from claude -p that indicate the session is unusable and we should
+     * expire it + fall back to a new session. Also covers "Not logged in" errors so
+     * those get surfaced cleanly instead of looking like a successful response.
+     */
+    private function looksLikeSessionFailure(array $result): bool
+    {
+        $blob = strtolower(($result['stdout'] ?? '') . ' ' . ($result['stderr'] ?? ''));
+
+        $needles = [
+            'invalid session',
+            'session not found',
+            'no such session',
+            'valid uuid',
+            'must be a valid',
+            'no conversation found',       // "No conversation found with session ID: ..."
+            'conversation not found',
+            'session does not exist',
+            'session id',                  // broad — catches most Claude Code session error templates
+        ];
+        foreach ($needles as $needle) {
+            if (strpos($blob, $needle) !== false) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Assemble a full system prompt for the Telegram conversation:
+     *   1. Capture reflex instructions (TOP — primacy matters, can't be drowned out)
+     *   2. SOUL.md  — voice/character/values
+     *   3. USER.md  — who Ross is
+     *   4. MEMORY.md — system rules
+     *   5. TOOLS.md  — DB/tool access
+     *   6. STATUS.md — today's status
+     */
+    private function buildSystemPromptFile(string $chatId): ?string
+    {
+        $parts = [];
+
+        // 1. Capture reflex at the TOP — this is the most important instruction.
+        $parts[] = $this->captureReflexInstructions();
+
+        $loadIfExists = function(string $pathKey, string $heading) use (&$parts) {
+            $file = $this->core->config("paths.{$pathKey}");
+            if ($file && file_exists($file)) {
+                $parts[] = "## {$heading}\n\n" . file_get_contents($file);
+            }
+        };
+
+        // 2. Voice / character
+        $loadIfExists('soul_file',   'Voice and Character (SOUL.md)');
+        // 3. Context files, in priority order
+        $loadIfExists('user_file',   'About Ross (USER.md)');
+        $loadIfExists('memory_file', 'System Operational Rules (MEMORY.md)');
+        $loadIfExists('tools_file',  'Tools & DB Access (TOOLS.md)');
+        $loadIfExists('status',      "Today's Status (STATUS.md)");
+
+        if (empty($parts)) return null;
+
+        $content = implode("\n\n---\n\n", $parts);
+        $tempFile = sys_get_temp_dir() . '/agentcore-bot-' . preg_replace('/[^a-z0-9]/i', '', $chatId) . '-' . bin2hex(random_bytes(4)) . '.md';
+        file_put_contents($tempFile, $content);
+        return $tempFile;
+    }
+
+    /**
+     * The capture reflex instructions. Kept strict and concrete — a hard contract, not a suggestion.
+     * This is the first thing in the bot's system prompt so it's not drowned out by context files.
+     */
+    private function captureReflexInstructions(): string
+    {
+        return <<<MD
+# How To Handle Messages From Ross (READ THIS FIRST — HARD REQUIREMENT)
+
+You are a scheduled-skills control interface running via Telegram. You have NO name, NO
+persona, NO identity. You are not an assistant called anything. You are the interface Ross
+talks to so his system can learn things and change.
+
+You are conversing with Ross via Telegram. Your job is not only to answer his message — it's
+to **capture rules, preferences, and facts** he tells you so they persist beyond this conversation
+and shape how scheduled skills behave tomorrow. If you don't capture them correctly, they are
+lost forever.
+
+## The Capture Contract (You Cannot Break This)
+
+When Ross states something worth remembering, you MUST wrap it in a capture tag that names
+the target file it should land in. Format:
+
+```
+[CAPTURE:<target>] <one-line durable statement of the fact or rule> [/CAPTURE]
+```
+
+**Target options:**
+
+- `[CAPTURE:user]` — facts about **Ross, people in his life, his family, his preferences, his background**. Lands in `USER.md`.
+- `[CAPTURE:memory]` — **global operational rules** that apply across the whole system (quiet hours, cross-skill behavior, hard rules). Lands in `MEMORY.md`.
+- `[CAPTURE:skill:<skill-name>]` — rules **specific to one scheduled skill**. Lands in `skills/<skill-name>/LEARNINGS.md`. Valid skill names: `basketball-reminder`, `contact-recommendations`, `content-drafting`, `daily-brief`, `end-of-day-synthesis`, `features-sync`, `heartbeat`, `job-scanner`, `job-scanner-pm`, `learning-curation`, `news-research`, `opportunity-finder`, `product-analysis-competitive`, `product-analysis-data`, `product-analysis-features`, `product-analysis-growth`, `prompt-audit`, `weekly-synthesis`, `workspace-audit`.
+
+## Examples
+
+Ross says: "Ryan French is my brother, Rebecca Terry is my sister, Brenda is my mom, Wendy is my wife — they're never business contacts."
+Your reply must contain:
+```
+[CAPTURE:user] Ryan French (brother), Rebecca Terry (sister), Brenda French (mom), Wendy French (wife). Family — never business contacts. [/CAPTURE]
+[CAPTURE:skill:contact-recommendations] Exclude Ryan French, Rebecca Terry, Brenda French, Wendy French from business contact recommendations — they are family. [/CAPTURE]
+```
+
+Ross says: "Don't bother me between 11pm and 7am."
+Your reply must contain:
+```
+[CAPTURE:memory] Quiet hours 11pm–7am PT — no Telegram messages to Ross during this window. [/CAPTURE]
+```
+
+Ross says: "Stop suggesting basketball reminders on Sundays."
+Your reply must contain:
+```
+[CAPTURE:skill:basketball-reminder] Skip Sundays — only fire on the configured Wednesday cadence. [/CAPTURE]
+```
+
+## The Hardest Rule
+
+**If Ross tells you to remember / note / save anything, and you reply "got it" / "noted" / "saved" WITHOUT a `[CAPTURE:...]` tag in your response — THE INFORMATION IS LOST AND YOU HAVE LIED TO HIM.**
+
+This is the one rule you cannot break. Acknowledging without tagging is worse than silence
+because Ross thinks it worked. The bot strips the capture tags from your reply before
+showing them, so your visible message is just the natural acknowledgement — but the tag is
+required or nothing is saved.
+
+If you aren't sure **which target file** something should go in, or the scope is ambiguous,
+**ask one sharp clarifying question instead of guessing**. Examples:
+
+- "For `contact-recommendations` only, or across all skills?"
+- "Is this a global rule (memory) or specific to the basketball reminder?"
+- "Who else should be included in the exclusion list?"
+
+Better to bother Ross for 10 seconds now than write a wrong rule he has to catch tomorrow.
+
+## Do NOT Capture
+
+- Small talk or greetings
+- Questions Ross asks you
+- One-off actions ("run the data check now") — those are commands, not rules
+- Anything ambiguous — ask first
+
+## Tone
+
+Short, direct, technical. No filler. No "I'd be happy to help". No summaries of what you
+just did. If you captured something, a brief "Got it." is enough — the capture block already
+records the rule; don't echo it back in plain text.
+MD;
+    }
+
+    /**
+     * Scan the reply for [CAPTURE:<target>]...[/CAPTURE] blocks, route each to the right
+     * target file via MemoryManager, and return the reply with capture blocks stripped out.
+     * Targets: 'user', 'memory', 'skill:<skill-name>'.
+     */
+    private function extractCaptures(string $reply): string
+    {
+        if (strpos($reply, '[CAPTURE:') === false) {
+            return $reply;
+        }
+
+        // Match [CAPTURE:target] body [/CAPTURE]. Target is everything after the colon up to the closing bracket.
+        $count = preg_match_all('/\[CAPTURE:([^\]]+)\](.*?)\[\/CAPTURE\]/s', $reply, $matches, PREG_SET_ORDER);
+        if ($count) {
+            foreach ($matches as $m) {
+                $target = trim($m[1]);
+                $body = trim($m[2]);
+                if ($body === '' || $target === '') continue;
+                try {
+                    $written = $this->memory->captureToTarget($target, $body);
+                    if ($written) {
+                        $this->logger->info("Captured from Telegram", ['target' => $target, 'file' => basename($written), 'body' => substr($body, 0, 120)]);
+                    } else {
+                        $this->logger->warn("Capture target unresolved", ['target' => $target, 'body' => substr($body, 0, 120)]);
+                    }
+                } catch (Throwable $e) {
+                    $this->logger->error("Failed to capture: {$e->getMessage()}");
+                }
+            }
+            // Strip all capture blocks from the user-visible reply.
+            $reply = preg_replace('/\[CAPTURE:[^\]]+\].*?\[\/CAPTURE\]\s*/s', '', $reply);
+            $reply = trim($reply);
+            if ($reply === '') {
+                $reply = "Got it.";
+            }
+        }
+
+        return $reply;
     }
 
     private function expireSessions(): void
@@ -438,23 +687,41 @@ class TelegramBot
 
     private function generateSessionId(): string
     {
-        return 'ac-' . bin2hex(random_bytes(8));
+        // Claude Code's --session-id requires a valid v4 UUID.
+        $bytes = random_bytes(16);
+        $bytes[6] = chr((ord($bytes[6]) & 0x0f) | 0x40); // version 4
+        $bytes[8] = chr((ord($bytes[8]) & 0x3f) | 0x80); // variant 10
+        return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($bytes), 4));
     }
 
-    private function executeCommand(string $cmd): array
+    /**
+     * Execute a claude -p command. Prompt is passed via stdin (avoids Windows cmd.exe
+     * argument-mangling bugs with long quoted strings). cwd is set to project_root so
+     * CLAUDE.md auto-loads.
+     */
+    private function execute(string $cmd, string $stdin = ''): array
     {
         $descriptors = [
-            0 => ['pipe', 'r'],
-            1 => ['pipe', 'w'],
-            2 => ['pipe', 'w'],
+            0 => ['pipe', 'r'],  // stdin
+            1 => ['pipe', 'w'],  // stdout
+            2 => ['pipe', 'w'],  // stderr
         ];
 
-        $process = proc_open($cmd, $descriptors, $pipes);
+        $cwd = $this->core->projectRoot();
+        if ($cwd && !is_dir($cwd)) {
+            $cwd = null;
+        }
+
+        $process = proc_open($cmd, $descriptors, $pipes, $cwd);
         if (!is_resource($process)) {
             return ['stdout' => '', 'stderr' => 'Failed to start process', 'exit_code' => 1];
         }
 
+        if ($stdin !== '') {
+            fwrite($pipes[0], $stdin);
+        }
         fclose($pipes[0]);
+
         $stdout = stream_get_contents($pipes[1]);
         $stderr = stream_get_contents($pipes[2]);
         fclose($pipes[1]);

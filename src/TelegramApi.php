@@ -120,6 +120,10 @@ class TelegramApi
             return null;
         }
 
-        return $data['result'] ?? null;
+        // Some Telegram methods (sendChatAction, deleteMessage, etc.) return bool true
+        // in the `result` field. This function is typed ?array, so coerce non-arrays to null —
+        // callers that need the payload (getUpdates, sendMessage) always receive arrays anyway.
+        $result = $data['result'] ?? null;
+        return is_array($result) ? $result : null;
     }
 }

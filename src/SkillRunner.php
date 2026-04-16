@@ -52,21 +52,51 @@ class SkillRunner
         $budget    = $overrides['max_budget_usd']  ?? $skillDefaults['max-budget'] ?? 2.00;
         $effort    = $overrides['effort']          ?? $skillDefaults['effort'] ?? 'high';
 
-        // Build the prompt
+        // Build the prompt. Avoid the word "skill" — Claude Code has a built-in Skill tool
+        // that intercepts "run the X skill" phrasing and tries to look X up in its native
+        // skill registry, which fails for our scheduled job names. Use "task" and "instructions".
         $date = date('Y-m-d');
         $day = date('l');
-        $prompt = "Execute this skill now. Today is {$day}, {$date}.";
+        $prompt = "The system prompt above contains a complete task called `{$skillName}` with "
+                . "numbered steps. Work through those steps yourself, right now, using the tools "
+                . "available (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch). Do NOT "
+                . "attempt to invoke `{$skillName}` as a Claude Code Skill tool — it is NOT one. "
+                . "It is a set of instructions you execute directly. Today is {$day}, {$date}.";
         if ($arguments !== '') {
             $prompt .= " Arguments: {$arguments}";
         }
 
-        // Check for LEARNINGS.md
+        // Assemble the complete system prompt as a SINGLE file:
+        //   1. SOUL.md         — voice/character/values, loaded first so tone is primed
+        //   2. SKILL.md        — the actual task instructions for this run
+        //   3. MEMORY.md       — global operational rules
+        //   4. LEARNINGS.md    — skill-specific accumulated rules (if any)
+        //
+        // CRITICAL: we must combine everything into ONE --append-system-prompt-file. Passing
+        // multiple --append-system-prompt-file flags causes Claude Code to use only the last
+        // one, silently dropping the earlier files — including the skill instructions themselves.
+        $combinedSystemPrompt = '';
+
+        $soulFile = $this->core->config('paths.soul_file');
+        if ($soulFile && file_exists($soulFile)) {
+            $combinedSystemPrompt .= file_get_contents($soulFile) . "\n\n---\n\n";
+        }
+
+        $combinedSystemPrompt .= "## Task Instructions for This Run\n\n" . file_get_contents($skillFile);
+
+        $memoryFile = $this->core->config('paths.memory_file');
+        if ($memoryFile && file_exists($memoryFile)) {
+            $memoryContent = file_get_contents($memoryFile);
+            if (trim($memoryContent) !== '') {
+                $combinedSystemPrompt .= "\n\n---\n\n## Global System Rules (MEMORY.md — authoritative)\n\n" . $memoryContent;
+            }
+        }
+
         $learningsFile = $skillDir . '/LEARNINGS.md';
-        $learningsContext = '';
         if (file_exists($learningsFile)) {
             $learnings = file_get_contents($learningsFile);
             if (trim($learnings) !== '') {
-                $learningsContext = "\n\n## Learnings from Previous Runs\n\n" . $learnings;
+                $combinedSystemPrompt .= "\n\n---\n\n## Learnings from Previous Runs of This Task\n\n" . $learnings;
             }
         }
 
@@ -74,27 +104,24 @@ class SkillRunner
         $claudeBin = $this->core->claudeBinary();
         $projectRoot = $this->core->projectRoot();
 
-        // Build command. No --max-budget-usd — Ross is on Claude Code subscription,
-        // not API billing. --max-turns is the real runaway guard.
+        // Write the combined system prompt to a temp file and pass it as a single
+        // --append-system-prompt-file. No --max-budget-usd — Ross is on Claude Code
+        // subscription, not API billing. --max-turns is the real runaway guard.
+        $tempFile = sys_get_temp_dir() . '/agentcore-prompt-' . $skillName . '-' . bin2hex(random_bytes(4)) . '.md';
+        file_put_contents($tempFile, $combinedSystemPrompt);
+
         $cmd = $claudeBin
             . ' -p'
             . ' --model ' . escapeshellarg($model)
             . ' --max-turns ' . (int)$maxTurns
             . ' --output-format json'
             . ' --dangerously-skip-permissions'
-            . ' --append-system-prompt-file ' . escapeshellarg($this->normalizePath($skillFile));
+            . ' --append-system-prompt-file ' . escapeshellarg($this->normalizePath($tempFile));
 
         // Note: intentionally NOT using --add-dir. Skills should access only
         // what they need via explicit paths or commands in their SKILL.md.
         // --add-dir causes Claude to explore the project directory, consuming
         // hundreds of thousands of cache tokens per run.
-
-        // Append learnings as additional system prompt if they exist
-        if ($learningsContext !== '') {
-            $tempFile = sys_get_temp_dir() . '/agentcore-learnings-' . $skillName . '.md';
-            file_put_contents($tempFile, $learningsContext);
-            $cmd .= ' --append-system-prompt-file ' . escapeshellarg($this->normalizePath($tempFile));
-        }
 
         // NOTE: prompt is passed via stdin, not as a command-line argument.
         // On Windows, passing long quoted strings through proc_open can trigger
@@ -110,6 +137,15 @@ class SkillRunner
         // Execute
         $startTime = microtime(true);
         $result = $this->execute($cmd, $prompt);
+
+        // Retry once on transient Anthropic upstream 5xx. claude-code prints those
+        // to stdout (not JSON) and exits non-zero, so the JSON parse below would miss it.
+        if (preg_match('/API Error:\s*5\d\d\b/', $result['stdout'] ?? '')) {
+            $this->logger->warn("Skill {$skillName} hit transient API 5xx; retrying once in 30s");
+            sleep(30);
+            $result = $this->execute($cmd, $prompt);
+        }
+
         $duration = (int)(microtime(true) - $startTime);
 
         // Clean up temp file
@@ -177,8 +213,9 @@ class SkillRunner
         // Skill succeeded if exit code is 0 AND JSON doesn't indicate error
         $success = ($result['exit_code'] === 0) && !$isError;
 
+        $finalError = $success ? null : $this->extractError($result, $errorDetail);
+
         if (!$success) {
-            $finalError = $errorDetail ?: ($result['stderr'] ?: 'Unknown error (exit code ' . $result['exit_code'] . ')');
             $this->logger->error("Skill failed: {$skillName}", [
                 'exit_code' => $result['exit_code'],
                 'error' => $finalError,
@@ -193,7 +230,7 @@ class SkillRunner
         return new SkillRunResult(
             success: $success,
             output: $output,
-            error: $success ? null : ($errorDetail ?: ($result['stderr'] ?: 'Unknown error')),
+            error: $finalError,
             duration: $duration,
             sessionId: $sessionId,
             budgetUsed: $budgetUsed,
@@ -290,6 +327,38 @@ class SkillRunner
      * @param string $cmd    The command to run
      * @param string $stdin  Optional data to write to the process's stdin
      */
+    /**
+     * Build the best available error string for a failed skill run.
+     *
+     * claude-code on Windows often writes the literal string "success" to stderr
+     * (a strerror(0) artifact) even when the real error is in stdout — e.g. an
+     * upstream "API Error: 500 ..." line that isn't valid JSON. We prefer any
+     * parsed JSON error, then look for known error patterns in stdout, then fall
+     * back to stderr (ignoring the bogus "success" sentinel).
+     */
+    private function extractError(array $result, ?string $errorDetail): string
+    {
+        if ($errorDetail) return $errorDetail;
+
+        $stdout = $result['stdout'] ?? '';
+        $stderr = trim($result['stderr'] ?? '');
+
+        if (preg_match('/^(API Error:[^\n]+)/m', $stdout, $m)) return trim($m[1]);
+        if (preg_match('/^(Fatal:[^\n]+)/m', $stdout, $m))      return trim($m[1]);
+        if (preg_match('/^(Error:[^\n]+)/m', $stdout, $m))      return trim($m[1]);
+
+        if ($stderr !== '' && strcasecmp($stderr, 'success') !== 0) {
+            return $stderr;
+        }
+
+        $trimmedStdout = trim($stdout);
+        if ($trimmedStdout !== '') {
+            return substr($trimmedStdout, 0, 500);
+        }
+
+        return 'Unknown error (exit code ' . ($result['exit_code'] ?? '?') . ')';
+    }
+
     private function execute(string $cmd, string $stdin = ''): array
     {
         $descriptors = [
