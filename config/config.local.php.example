@@ -6,38 +6,57 @@
  * This file is gitignored — your credentials stay local.
  *
  * Any key here overrides the matching key in config.defaults.php.
- * You only need to include keys you want to change.
+ * You only need to include keys you want to change. The minimum viable
+ * config is db credentials + paths.project_root.
  */
 
 return [
     'db' => [
         'user' => 'your_mysql_user',
         'pass' => 'your_mysql_password',
-        // 'name' => 'agentcore',   // default is fine for most setups
+        // 'name' => 'agentcore',
         // 'host' => '127.0.0.1',
         // 'port' => 3306,
     ],
 
     'paths' => [
-        // Point these to your project's directories
-        'skills'       => '/path/to/your/project/skills',
-        'memory'       => '/path/to/your/project/memory',
-        'status'       => '/path/to/your/project/STATUS.md',
-        'persona'      => '/path/to/your/project/persona.md',
-        'claude_md'    => '/path/to/your/project/CLAUDE.md',
-        'project_root' => '/path/to/your/project',
+        // Point project_root at your personal workspace directory — the place
+        // that holds your skills/, memory/, USER.md, SOUL.md, MEMORY.md, etc.
+        // The framework code stays in this AgentCore checkout; your personal
+        // data lives separately. All other paths (skills, memory, USER.md,
+        // SOUL.md, MEMORY.md, TOOLS.md, STATUS.md, TELEGRAM_INSTRUCTIONS.md)
+        // default to subpaths of project_root — override individually only
+        // if your layout differs.
+        'project_root' => '/path/to/your/workspace',
     ],
 
     // 'claude' => [
-    //     'binary'        => 'claude',              // path to claude CLI
-    //     'default_model' => 'sonnet',              // haiku, sonnet, or opus
-    //     'mysql_client'  => 'mysql',               // path to mysql client
+    //     'binary'        => 'claude',
+    //     'default_model' => 'sonnet',                // haiku, sonnet, or opus
+    //     'mysql_client'  => 'mysql',                 // path to mysql client
     // ],
 
     // 'telegram' => [
-    //     'bot_token'        => 'your-bot-token',
-    //     'allowed_chat_ids' => '123456789',        // comma-separated chat IDs
-    //     'session_timeout'  => 1800,               // 30 min idle timeout
+    //     'bot_token'        => 'your-bot-token',     // or set TELEGRAM_BOT_TOKEN env var
+    //     'allowed_chat_ids' => '123456789',          // comma-separated chat IDs
+    //     'session_timeout'  => 1800,                 // 30 min idle timeout
+    //     'user_heading'     => 'About You',          // heading prepended to USER.md
+    // ],
+
+    // Opt in to usage logging to an external app DB. The target table must
+    // already exist with the columns inserted by Scheduler::writeUsageLog():
+    // timestamp, provider, model, task_type, cron_job_name, description,
+    // tokens_in, tokens_out, cache_read, cache_write, cost_usd, session_id.
+    // 'usage_log' => [
+    //     'enabled' => true,
+    //     'db'      => 'my_app_db',
+    //     'table'   => 'usage_log',
+    //     // host/port/user/pass fall back to db.* unless explicitly set here
+    // ],
+
+    // 'web' => [
+    //     'auth_mode' => 'local',                     // local | token | open
+    //     'token'     => 'long-random-shared-secret', // required for auth_mode=token
     // ],
 
     'timezone' => 'America/Los_Angeles',

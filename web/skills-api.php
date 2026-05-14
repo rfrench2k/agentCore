@@ -9,18 +9,34 @@
 header('Content-Type: application/json');
 
 require_once __DIR__ . '/../src/AgentCore.php';
+$core = AgentCore::init(__DIR__ . '/../config/config.php');
+
+// Access control — see web/auth.php for modes. Forces an early exit on failure.
+// The Accept header is set so auth.php returns a JSON error body for this endpoint.
+$_SERVER['HTTP_ACCEPT'] = 'application/json';
+require_once __DIR__ . '/auth.php';
+
 require_once __DIR__ . '/../src/SkillRunner.php';
 require_once __DIR__ . '/../src/CronExpression.php';
 require_once __DIR__ . '/../src/Scheduler.php';
 require_once __DIR__ . '/../src/MemoryManager.php';
 
-$core = AgentCore::init(__DIR__ . '/../config/config.php');
 $db = $core->db();
 $runner = new SkillRunner($core);
 $scheduler = new Scheduler($core);
 $memory = new MemoryManager($core);
 
 $action = $_GET['action'] ?? $_POST['action'] ?? '';
+
+// Skill names are used to construct file paths (skills/<name>/SKILL.md). Anything that
+// isn't a strict slug could traverse out of skillsDir() — guard at the API boundary so
+// a future endpoint added below doesn't have to remember to validate. Lowercase-only
+// to match the capture-routing validator in MemoryManager::captureToTarget — keeps
+// names portable across case-sensitive (Linux) and case-insensitive (Windows, default
+// macOS) filesystems.
+$validSkillName = static function ($name): bool {
+    return is_string($name) && $name !== '' && (bool)preg_match('/^[a-z0-9][a-z0-9_-]*$/', $name);
+};
 
 try {
     switch ($action) {
@@ -54,6 +70,10 @@ try {
 
         case 'get_skill':
             $name = $_GET['name'] ?? '';
+            if (!$validSkillName($name)) {
+                echo json_encode(['ok' => false, 'error' => 'Invalid skill name']);
+                break;
+            }
             $skillDir = $core->skillsDir() . '/' . $name;
             $skillFile = $skillDir . '/SKILL.md';
             $learningsFile = $skillDir . '/LEARNINGS.md';
@@ -74,10 +94,14 @@ try {
         case 'save_skill':
             $name = $_POST['name'] ?? '';
             $content = $_POST['content'] ?? '';
+            if (!$validSkillName($name)) {
+                echo json_encode(['ok' => false, 'error' => 'Invalid skill name']);
+                break;
+            }
             $skillFile = $core->skillsDir() . '/' . $name . '/SKILL.md';
 
-            if (!$name || !file_exists(dirname($skillFile))) {
-                echo json_encode(['ok' => false, 'error' => 'Invalid skill']);
+            if (!file_exists(dirname($skillFile))) {
+                echo json_encode(['ok' => false, 'error' => 'Skill not found']);
                 break;
             }
 
@@ -88,12 +112,16 @@ try {
         case 'save_learnings':
             $name = $_POST['name'] ?? '';
             $content = $_POST['content'] ?? '';
-            $file = $core->skillsDir() . '/' . $name . '/LEARNINGS.md';
-
-            if (!$name) {
-                echo json_encode(['ok' => false, 'error' => 'Invalid skill']);
+            if (!$validSkillName($name)) {
+                echo json_encode(['ok' => false, 'error' => 'Invalid skill name']);
                 break;
             }
+            $skillDir = $core->skillsDir() . '/' . $name;
+            if (!is_dir($skillDir)) {
+                echo json_encode(['ok' => false, 'error' => 'Skill not found']);
+                break;
+            }
+            $file = $skillDir . '/LEARNINGS.md';
 
             file_put_contents($file, $content, LOCK_EX);
             echo json_encode(['ok' => true]);
@@ -103,8 +131,8 @@ try {
             $name = $_POST['name'] ?? '';
             $args = $_POST['arguments'] ?? '';
 
-            if (!$name) {
-                echo json_encode(['ok' => false, 'error' => 'Skill name required']);
+            if (!$validSkillName($name)) {
+                echo json_encode(['ok' => false, 'error' => 'Invalid skill name']);
                 break;
             }
 
@@ -136,8 +164,11 @@ try {
             $effort   = $_POST['effort'] ?? 'high';
             $enabled  = ($_POST['enabled'] ?? '1') === '1';
 
-            if (!$name || !$cron) {
-                echo json_encode(['ok' => false, 'error' => 'Name and cron required']);
+            // Allow exec:<id> form for direct shell schedules; otherwise require strict slug.
+            $isExec = is_string($name) && str_starts_with($name, 'exec:');
+            $execIdValid = $isExec && $validSkillName(substr($name, 5));
+            if (!$cron || !($validSkillName($name) || $execIdValid)) {
+                echo json_encode(['ok' => false, 'error' => 'Invalid name or missing cron']);
                 break;
             }
 
@@ -148,6 +179,11 @@ try {
         case 'toggle_schedule':
             $name = $_POST['skill_name'] ?? '';
             $enabled = ($_POST['enabled'] ?? '1') === '1';
+            $isExec = is_string($name) && str_starts_with($name, 'exec:') && $validSkillName(substr($name, 5));
+            if (!($validSkillName($name) || $isExec)) {
+                echo json_encode(['ok' => false, 'error' => 'Invalid skill name']);
+                break;
+            }
 
             $stmt = $db->prepare("UPDATE skill_schedules SET enabled = ? WHERE skill_name = ?");
             $stmt->execute([$enabled ? 1 : 0, $name]);
@@ -156,6 +192,11 @@ try {
 
         case 'delete_schedule':
             $name = $_POST['skill_name'] ?? '';
+            $isExec = is_string($name) && str_starts_with($name, 'exec:') && $validSkillName(substr($name, 5));
+            if (!($validSkillName($name) || $isExec)) {
+                echo json_encode(['ok' => false, 'error' => 'Invalid skill name']);
+                break;
+            }
             $stmt = $db->prepare("DELETE FROM skill_schedules WHERE skill_name = ?");
             $stmt->execute([$name]);
             echo json_encode(['ok' => true]);

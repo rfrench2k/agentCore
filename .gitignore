@@ -2,5 +2,7 @@ config/config.local.php
 logs/
 *.log
 .env
+scripts/.agentcore.env
 vendor/
 node_modules/
+_smoke_*.php

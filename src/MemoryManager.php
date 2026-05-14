@@ -24,9 +24,10 @@ class MemoryManager
     }
 
     /**
-     * Archive today's STATUS.md (the orchestrator runs at ~10:55 PM PT on day N,
-     * archiving the content of day N to memory/archive/{day N}.md) and reset
-     * STATUS.md with a fresh template for day N+1 (tomorrow).
+     * Archive today's STATUS.md to memory/archive/{today}.md and reset STATUS.md
+     * with a fresh template dated for tomorrow. Designed to be called by an
+     * end-of-day skill scheduled shortly before midnight in the operator's
+     * local timezone — the content being archived is treated as "today".
      *
      * Order matters: COPY first, then OVERWRITE. Never the reverse — that loses data.
      */
@@ -39,7 +40,6 @@ class MemoryManager
             mkdir($archiveDir, 0755, true);
         }
 
-        // The file content we're archiving IS today's content (the orchestrator runs at 10:55 PM PT).
         $todayDate = date('Y-m-d');
         $tomorrowDate = date('Y-m-d', strtotime('+1 day'));
         $tomorrowDay = date('l', strtotime('+1 day'));
@@ -222,6 +222,16 @@ class MemoryManager
         $date = date('Y-m-d');
         $line = "- **{$date}** — {$body}\n";
         file_put_contents($file, $line, FILE_APPEND | LOCK_EX);
+
+        // Flag bloat early so prune-learnings has a clear signal in the logs. Threshold
+        // is intentionally low — the prompt cost compounds across every run of this skill.
+        $lineCount = substr_count((string)file_get_contents($file), "\n");
+        if ($lineCount > 100) {
+            $this->logger->warn("LEARNINGS.md exceeds 100 lines — prune-learnings should prune on next run", [
+                'file' => $file,
+                'lines' => $lineCount,
+            ]);
+        }
 
         $this->logger->info("Captured to LEARNINGS.md", ['file' => $file, 'body' => substr($body, 0, 120)]);
         return $file;

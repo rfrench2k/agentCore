@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-16"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>AgentCore: Checks for due skills every 5 minutes and runs them via claude -p</Description>
@@ -16,7 +16,7 @@
   </Triggers>
   <Principals>
     <Principal id="Author">
-      <UserId>Administrator</UserId>
+      <UserId>__AGENTCORE_USER__</UserId>
       <LogonType>S4U</LogonType>
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
@@ -42,8 +42,8 @@
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>D:\AdvancedVentures\htdocs\agentcore\scripts\scheduler.bat</Command>
-      <WorkingDirectory>D:\AdvancedVentures\htdocs\agentcore</WorkingDirectory>
+      <Command>__AGENTCORE_PATH__\scripts\scheduler.bat</Command>
+      <WorkingDirectory>__AGENTCORE_PATH__</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>

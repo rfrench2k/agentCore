@@ -323,22 +323,44 @@ class Scheduler
     }
 
     /**
-     * Write a row to assistant.usage_log for cost tracking.
-     * The usage_log table is in the user's application DB (not agentcore's).
+     * Write a row to an external usage_log table for cost tracking. Opt-in via
+     * config.usage_log.enabled. The target DB and table are configurable —
+     * connection details fall back to the main db.* config if not overridden.
+     *
+     * The target table must have columns matching the INSERT below:
+     *   timestamp, provider, model, task_type, cron_job_name, description,
+     *   tokens_in, tokens_out, cache_read, cache_write, cost_usd, session_id.
      */
     private function writeUsageLog(string $skillName, SkillRunResult $result, string $triggerType): void
     {
+        $cfg = $this->core->config('usage_log');
+        if (!$cfg || empty($cfg['enabled']) || empty($cfg['db'])) {
+            return;
+        }
+
         // Only log if we got real usage data from claude -p JSON output
         if ($result->tokensIn === 0 && $result->tokensOut === 0 && $result->budgetUsed === null) {
             return;
         }
 
+        $mainDb = $this->core->config('db');
+        $host  = $cfg['host'] ?: $mainDb['host'];
+        $port  = $cfg['port'] ?: $mainDb['port'];
+        $user  = $cfg['user'] ?: $mainDb['user'];
+        $pass  = $cfg['pass'] ?: $mainDb['pass'];
+        $dbName = $cfg['db'];
+        $table  = $cfg['table'] ?: 'usage_log';
+
+        // Guard against SQL injection in the table identifier — config-controlled
+        // but better to fail closed if someone sets a malformed value.
+        if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $table)) {
+            $this->logger->warn("usage_log.table is not a valid identifier; skipping log write", ['table' => $table]);
+            return;
+        }
+
         try {
-            // Connect to assistant DB using the same MySQL user as agentcore
-            // (the sysdba user has access to both databases on Ross's setup)
-            $c = $this->core->config('db');
-            $dsn = "mysql:host={$c['host']};port={$c['port']};dbname=assistant;charset=utf8mb4";
-            $aDb = new \PDO($dsn, $c['user'], $c['pass'], [
+            $dsn = "mysql:host={$host};port={$port};dbname={$dbName};charset=utf8mb4";
+            $aDb = new \PDO($dsn, $user, $pass, [
                 \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
             ]);
 
@@ -359,7 +381,7 @@ class Scheduler
             }
 
             $stmt = $aDb->prepare("
-                INSERT INTO usage_log
+                INSERT INTO `{$table}`
                     (timestamp, provider, model, task_type, cron_job_name, description,
                      tokens_in, tokens_out, cache_read, cache_write, cost_usd, session_id)
                 VALUES (NOW(), 'anthropic', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

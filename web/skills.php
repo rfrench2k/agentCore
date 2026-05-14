@@ -5,13 +5,9 @@
  * View/edit skills, manage schedules, and browse run history.
  */
 
-// Auth: local network only by default
-$remoteIP = $_SERVER['REMOTE_ADDR'] ?? '';
-$isLocal = in_array($remoteIP, ['127.0.0.1', '::1', '']) || str_starts_with($remoteIP, '192.168.');
-if (!$isLocal) {
-    http_response_code(403);
-    exit('Access denied');
-}
+require_once __DIR__ . '/../src/AgentCore.php';
+AgentCore::init(__DIR__ . '/../config/config.php');
+require_once __DIR__ . '/auth.php';
 ?>
 <!DOCTYPE html>
 <html lang="en">

@@ -105,8 +105,9 @@ class SkillRunner
         $projectRoot = $this->core->projectRoot();
 
         // Write the combined system prompt to a temp file and pass it as a single
-        // --append-system-prompt-file. No --max-budget-usd — Ross is on Claude Code
-        // subscription, not API billing. --max-turns is the real runaway guard.
+        // --append-system-prompt-file. No --max-budget-usd flag is set — AgentCore
+        // targets the Claude Code subscription, not API billing. --max-turns is
+        // the real runaway guard.
         $tempFile = sys_get_temp_dir() . '/agentcore-prompt-' . $skillName . '-' . bin2hex(random_bytes(4)) . '.md';
         file_put_contents($tempFile, $combinedSystemPrompt);
 
@@ -367,7 +368,7 @@ class SkillRunner
             2 => ['pipe', 'w'],  // stderr
         ];
 
-        // Set CWD to project_root (skoopix) so Claude Code auto-loads CLAUDE.md
+        // Set CWD to project_root so Claude Code auto-loads the workspace CLAUDE.md.
         $cwd = $this->core->projectRoot();
         if ($cwd && !is_dir($cwd)) {
             $cwd = null;

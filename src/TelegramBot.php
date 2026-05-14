@@ -496,12 +496,11 @@ class TelegramBot
             'invalid session',
             'session not found',
             'no such session',
-            'valid uuid',
-            'must be a valid',
+            'session does not exist',
             'no conversation found',       // "No conversation found with session ID: ..."
             'conversation not found',
-            'session does not exist',
-            'session id',                  // broad — catches most Claude Code session error templates
+            'valid uuid',                  // session id was malformed
+            'must be a valid',             // same shape, different wording
         ];
         foreach ($needles as $needle) {
             if (strpos($blob, $needle) !== false) return true;
@@ -513,7 +512,7 @@ class TelegramBot
      * Assemble a full system prompt for the Telegram conversation:
      *   1. Capture reflex instructions (TOP — primacy matters, can't be drowned out)
      *   2. SOUL.md  — voice/character/values
-     *   3. USER.md  — who Ross is
+     *   3. USER.md  — who the operator is
      *   4. MEMORY.md — system rules
      *   5. TOOLS.md  — DB/tool access
      *   6. STATUS.md — today's status
@@ -532,10 +531,12 @@ class TelegramBot
             }
         };
 
+        $userHeading = $this->core->config('telegram.user_heading') ?: 'About You';
+
         // 2. Voice / character
         $loadIfExists('soul_file',   'Voice and Character (SOUL.md)');
         // 3. Context files, in priority order
-        $loadIfExists('user_file',   'About Ross (USER.md)');
+        $loadIfExists('user_file',   $userHeading . ' (USER.md)');
         $loadIfExists('memory_file', 'System Operational Rules (MEMORY.md)');
         $loadIfExists('tools_file',  'Tools & DB Access (TOOLS.md)');
         $loadIfExists('status',      "Today's Status (STATUS.md)");
@@ -549,27 +550,84 @@ class TelegramBot
     }
 
     /**
-     * The capture reflex instructions. Kept strict and concrete — a hard contract, not a suggestion.
-     * This is the first thing in the bot's system prompt so it's not drowned out by context files.
+     * The capture-reflex instructions placed at the top of the bot's system prompt.
+     *
+     * Source of truth is the workspace file at paths.telegram_instructions (typically
+     * TELEGRAM_INSTRUCTIONS.md in the project root). The workspace file may contain
+     * the placeholder {{SKILL_LIST}}, which is substituted with the live list of
+     * directory names under paths.skills at runtime.
+     *
+     * If the workspace file is missing, a built-in generic version is used so a
+     * fresh install behaves reasonably until the operator customizes the file.
      */
     private function captureReflexInstructions(): string
     {
+        $template = null;
+        $file = $this->core->config('paths.telegram_instructions');
+        if ($file && file_exists($file)) {
+            $template = file_get_contents($file);
+        }
+        if (!$template) {
+            $template = $this->defaultCaptureReflexInstructions();
+        }
+
+        $skillList = $this->discoverSkillNames();
+        $rendered = strtr($template, [
+            '{{SKILL_LIST}}'        => $skillList === ''
+                ? '(no skills found in skills directory)'
+                : $skillList,
+            '{{SKILL_LIST_INLINE}}' => $skillList === ''
+                ? '(no skills found in skills directory)'
+                : $skillList,
+        ]);
+
+        return $rendered;
+    }
+
+    /**
+     * Comma-separated, backtick-quoted list of valid skill names, discovered by
+     * scanning paths.skills for directories that contain a SKILL.md. Empty string
+     * if the skills directory does not exist or contains no skills.
+     */
+    private function discoverSkillNames(): string
+    {
+        $skillsDir = $this->core->skillsDir();
+        if (!$skillsDir || !is_dir($skillsDir)) {
+            return '';
+        }
+        $names = [];
+        foreach (scandir($skillsDir) ?: [] as $entry) {
+            if ($entry === '.' || $entry === '..') continue;
+            if (is_file($skillsDir . '/' . $entry . '/SKILL.md')) {
+                $names[] = $entry;
+            }
+        }
+        sort($names);
+        return implode(', ', array_map(fn($n) => "`{$n}`", $names));
+    }
+
+    /**
+     * Generic fallback used when no workspace TELEGRAM_INSTRUCTIONS.md is present.
+     * Describes the capture-tag protocol without operator-specific examples. The
+     * intended path is for each workspace to ship its own customized version.
+     */
+    private function defaultCaptureReflexInstructions(): string
+    {
         return <<<MD
-# How To Handle Messages From Ross (READ THIS FIRST — HARD REQUIREMENT)
+# How To Handle Messages (READ THIS FIRST — HARD REQUIREMENT)
 
 You are a scheduled-skills control interface running via Telegram. You have NO name, NO
-persona, NO identity. You are not an assistant called anything. You are the interface Ross
-talks to so his system can learn things and change.
+persona, NO identity. You are the interface the operator talks to so the system can learn
+things and change.
 
-You are conversing with Ross via Telegram. Your job is not only to answer his message — it's
-to **capture rules, preferences, and facts** he tells you so they persist beyond this conversation
-and shape how scheduled skills behave tomorrow. If you don't capture them correctly, they are
-lost forever.
+Your job is not only to answer the operator's message — it is to **capture rules, preferences,
+and facts** they tell you so those persist beyond this conversation and shape how scheduled
+skills behave tomorrow. If you don't capture them correctly, they are lost forever.
 
 ## The Capture Contract (You Cannot Break This)
 
-When Ross states something worth remembering, you MUST wrap it in a capture tag that names
-the target file it should land in. Format:
+When the operator states something worth remembering, you MUST wrap it in a capture tag that
+names the target file it should land in. Format:
 
 ```
 [CAPTURE:<target>] <one-line durable statement of the fact or rule> [/CAPTURE]
@@ -577,61 +635,34 @@ the target file it should land in. Format:
 
 **Target options:**
 
-- `[CAPTURE:user]` — facts about **Ross, people in his life, his family, his preferences, his background**. Lands in `USER.md`.
-- `[CAPTURE:memory]` — **global operational rules** that apply across the whole system (quiet hours, cross-skill behavior, hard rules). Lands in `MEMORY.md`.
-- `[CAPTURE:skill:<skill-name>]` — rules **specific to one scheduled skill**. Lands in `skills/<skill-name>/LEARNINGS.md`. Valid skill names: `basketball-reminder`, `contact-recommendations`, `content-drafting`, `daily-brief`, `end-of-day-synthesis`, `features-sync`, `heartbeat`, `job-scanner`, `job-scanner-pm`, `learning-curation`, `news-research`, `opportunity-finder`, `product-analysis-competitive`, `product-analysis-data`, `product-analysis-features`, `product-analysis-growth`, `prompt-audit`, `weekly-synthesis`, `workspace-audit`.
-
-## Examples
-
-Ross says: "Ryan French is my brother, Rebecca Terry is my sister, Brenda is my mom, Wendy is my wife — they're never business contacts."
-Your reply must contain:
-```
-[CAPTURE:user] Ryan French (brother), Rebecca Terry (sister), Brenda French (mom), Wendy French (wife). Family — never business contacts. [/CAPTURE]
-[CAPTURE:skill:contact-recommendations] Exclude Ryan French, Rebecca Terry, Brenda French, Wendy French from business contact recommendations — they are family. [/CAPTURE]
-```
-
-Ross says: "Don't bother me between 11pm and 7am."
-Your reply must contain:
-```
-[CAPTURE:memory] Quiet hours 11pm–7am PT — no Telegram messages to Ross during this window. [/CAPTURE]
-```
-
-Ross says: "Stop suggesting basketball reminders on Sundays."
-Your reply must contain:
-```
-[CAPTURE:skill:basketball-reminder] Skip Sundays — only fire on the configured Wednesday cadence. [/CAPTURE]
-```
+- `[CAPTURE:user]` — facts about the operator, their people, their preferences, their background. Lands in `USER.md`.
+- `[CAPTURE:memory]` — global operational rules that apply across the whole system (quiet hours, cross-skill behavior, hard rules). Lands in `MEMORY.md`.
+- `[CAPTURE:skill:<skill-name>]` — rules specific to one scheduled skill. Lands in `skills/<skill-name>/LEARNINGS.md`. Valid skill names: {{SKILL_LIST}}.
 
 ## The Hardest Rule
 
-**If Ross tells you to remember / note / save anything, and you reply "got it" / "noted" / "saved" WITHOUT a `[CAPTURE:...]` tag in your response — THE INFORMATION IS LOST AND YOU HAVE LIED TO HIM.**
+**If the operator tells you to remember / note / save anything, and you reply "got it" / "noted"
+/ "saved" WITHOUT a `[CAPTURE:...]` tag in your response — THE INFORMATION IS LOST.**
 
-This is the one rule you cannot break. Acknowledging without tagging is worse than silence
-because Ross thinks it worked. The bot strips the capture tags from your reply before
-showing them, so your visible message is just the natural acknowledgement — but the tag is
-required or nothing is saved.
+Acknowledging without tagging is worse than silence, because the operator believes it worked.
+The bot strips the capture tags from your reply before showing them, so your visible message
+is just the natural acknowledgement — but the tag is required or nothing is saved.
 
-If you aren't sure **which target file** something should go in, or the scope is ambiguous,
-**ask one sharp clarifying question instead of guessing**. Examples:
-
-- "For `contact-recommendations` only, or across all skills?"
-- "Is this a global rule (memory) or specific to the basketball reminder?"
-- "Who else should be included in the exclusion list?"
-
-Better to bother Ross for 10 seconds now than write a wrong rule he has to catch tomorrow.
+If you are not sure which target file something should go in, or the scope is ambiguous,
+ask one sharp clarifying question instead of guessing.
 
 ## Do NOT Capture
 
 - Small talk or greetings
-- Questions Ross asks you
+- Questions the operator asks you
 - One-off actions ("run the data check now") — those are commands, not rules
 - Anything ambiguous — ask first
 
 ## Tone
 
-Short, direct, technical. No filler. No "I'd be happy to help". No summaries of what you
-just did. If you captured something, a brief "Got it." is enough — the capture block already
-records the rule; don't echo it back in plain text.
+Short, direct, technical. No filler. No "I'd be happy to help". No summaries of what you just
+did. If you captured something, a brief "Got it." is enough — the capture block already records
+the rule; don't echo it back in plain text.
 MD;
     }
 
