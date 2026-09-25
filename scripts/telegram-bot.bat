@@ -9,7 +9,7 @@ REM a sibling .agentcore.env file in this scripts\ directory):
 REM   AGENTCORE_WORKSPACE  — full path to your workspace dir (where .env lives)
 REM   AGENTCORE_PHP_BIN    — full path to php.exe (optional; defaults to "php")
 
-setlocal enabledelayedexpansion
+setlocal disabledelayedexpansion
 
 if exist "%~dp0.agentcore.env" call :load_env "%~dp0.agentcore.env"
 
@@ -31,15 +31,8 @@ REM immediately when run by Task Scheduler, breaking the restart loop.
 powershell -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 5"
 goto loop
 
-REM ---- subroutine: parse KEY=VALUE lines from %1, skipping comments and blanks ----
 :load_env
-for /f "usebackq tokens=1,* delims==" %%A in ("%~1") do (
-    set "_KEY=%%A"
-    set "_VAL=%%B"
-    if defined _KEY if defined _VAL (
-        if not "!_KEY:~0,1!"=="#" set "!_KEY!=!_VAL!"
-    )
+for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%~1") do (
+    if not "%%B"=="" set "%%A=%%B"
 )
-set "_KEY="
-set "_VAL="
 goto :eof

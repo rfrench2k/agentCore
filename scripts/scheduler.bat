@@ -7,7 +7,7 @@ REM a sibling .agentcore.env file in this scripts\ directory):
 REM   AGENTCORE_WORKSPACE  — full path to your workspace dir (where .env lives)
 REM   AGENTCORE_PHP_BIN    — full path to php.exe (optional; defaults to "php")
 
-setlocal enabledelayedexpansion
+setlocal disabledelayedexpansion
 
 REM Load optional .agentcore.env from this scripts\ dir so users can set
 REM AGENTCORE_WORKSPACE and AGENTCORE_PHP_BIN persistently without editing this file.
@@ -25,15 +25,8 @@ if not defined AGENTCORE_PHP_BIN set "AGENTCORE_PHP_BIN=php"
 endlocal
 goto :eof
 
-REM ---- subroutine: parse KEY=VALUE lines from %1, skipping comments and blanks ----
 :load_env
-for /f "usebackq tokens=1,* delims==" %%A in ("%~1") do (
-    set "_KEY=%%A"
-    set "_VAL=%%B"
-    if defined _KEY if defined _VAL (
-        if not "!_KEY:~0,1!"=="#" set "!_KEY!=!_VAL!"
-    )
+for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%~1") do (
+    if not "%%B"=="" set "%%A=%%B"
 )
-set "_KEY="
-set "_VAL="
 goto :eof
