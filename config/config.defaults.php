@@ -17,7 +17,7 @@
 return [
     'db' => [
         'host' => getenv('AGENTCORE_DB_HOST') ?: '127.0.0.1',
-        'port' => (int)(getenv('AGENTCORE_DB_PORT') ?: 3306),
+        'port' => (int)(getenv('AGENTCORE_DB_PORT') ?: 3307),
         'user' => getenv('AGENTCORE_DB_USER') ?: '',
         'pass' => getenv('AGENTCORE_DB_PASS') ?: '',
         'name' => getenv('AGENTCORE_DB_NAME') ?: 'agentcore',
