@@ -403,30 +403,11 @@ class Scheduler
         }
     }
 
+    /** A skill failing is not critical: logged only, never sent to Telegram (owner 2026-10-04). */
     private function sendAlert(string $skillName, SkillRunResult $result, int $failures, bool $disabled): void
     {
-        $token = $this->core->config('telegram.bot_token');
-        $chatIds = $this->core->config('telegram.allowed_chat_ids');
-
-        if (!$token || !$chatIds) return;
-
-        $msg = "AgentCore: Skill '{$skillName}' failed";
-        if ($disabled) {
-            $msg .= " (AUTO-DISABLED after {$failures} failures)";
-        } else {
-            $msg .= " ({$failures} consecutive failure(s))";
-        }
-        $msg .= "\n\nError: " . substr($result->error ?? 'Unknown', 0, 500);
-
-        foreach (explode(',', $chatIds) as $chatId) {
-            $chatId = trim($chatId);
-            if (!$chatId) continue;
-
-            @file_get_contents('https://api.telegram.org/bot' . $token . '/sendMessage?' . http_build_query([
-                'chat_id' => $chatId,
-                'text' => $msg,
-            ]));
-        }
+        $this->logger->warn("Skill '{$skillName}' failed" . ($disabled ? " (AUTO-DISABLED after {$failures} failures)" : " ({$failures} consecutive failure(s))")
+            . ': ' . substr($result->error ?? 'Unknown', 0, 500));
     }
 }
 
