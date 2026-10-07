@@ -25,7 +25,7 @@ set "EXITCODE=%errorlevel%"
 REM Log every restart attempt to a wrapper-level log. Without this, a silent crash
 REM loop or a failed sleep is invisible — which is exactly how this script broke once
 REM when "timeout" failed in a no-console Task Scheduler context.
->> "%~dp0..\logs\telegram-wrapper.log" echo [%DATE% %TIME%] Bot exited code=%EXITCODE%, restarting in 5s
+>> "D:\AdvancedVentures\logs\agentcore\telegram-wrapper.log" echo [%DATE% %TIME%] Bot exited code=%EXITCODE%, restarting in 5s
 REM Use PowerShell for the sleep — "timeout" requires a console handle and exits
 REM immediately when run by Task Scheduler, breaking the restart loop.
 powershell -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 5"
