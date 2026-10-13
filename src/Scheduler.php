@@ -135,14 +135,14 @@ class Scheduler
                 UPDATE skill_schedules
                 SET last_run_at = NOW(), next_run_at = ?, consecutive_failures = 0
                 WHERE id = ?
-            ")->execute([$nextRun->format('Y-m-d H:i:s'), $schedule['id']]);
+            ")->execute([$nextRun?->format('Y-m-d H:i:s'), $schedule['id']]);
         } else {
             $failures = $schedule['consecutive_failures'] + 1;
             $this->db->prepare("
                 UPDATE skill_schedules
                 SET last_run_at = NOW(), next_run_at = ?, consecutive_failures = ?
                 WHERE id = ?
-            ")->execute([$nextRun->format('Y-m-d H:i:s'), $failures, $schedule['id']]);
+            ")->execute([$nextRun?->format('Y-m-d H:i:s'), $failures, $schedule['id']]);
             $this->logger->error("Exec failed ({$failures} consecutive): {$execCommand}\n{$stderr}");
         }
     }
@@ -225,7 +225,7 @@ class Scheduler
                 next_run_at = VALUES(next_run_at)
         ");
         $stmt->execute([
-            $skillName, $cronExpression, $tz, $model, $maxTurns, $maxBudget, $effort, $enabled ? 1 : 0, $nextRun->format('Y-m-d H:i:s')
+            $skillName, $cronExpression, $tz, $model, $maxTurns, $maxBudget, $effort, $enabled ? 1 : 0, $nextRun?->format('Y-m-d H:i:s')
         ]);
     }
 
@@ -267,7 +267,7 @@ class Scheduler
                 UPDATE skill_schedules
                 SET last_run_at = NOW(), next_run_at = ?, consecutive_failures = 0
                 WHERE id = ?
-            ")->execute([$nextRun->format('Y-m-d H:i:s'), $schedule['id']]);
+            ")->execute([$nextRun?->format('Y-m-d H:i:s'), $schedule['id']]);
         } else {
             $failures = $schedule['consecutive_failures'] + 1;
             $autoDisable = $schedule['auto_disable_after'];
@@ -277,7 +277,7 @@ class Scheduler
                 UPDATE skill_schedules
                 SET last_run_at = NOW(), next_run_at = ?, consecutive_failures = ?, enabled = ?
                 WHERE id = ?
-            ")->execute([$nextRun->format('Y-m-d H:i:s'), $failures, $disable, $schedule['id']]);
+            ")->execute([$nextRun?->format('Y-m-d H:i:s'), $failures, $disable, $schedule['id']]);
 
             if (!$disable) {
                 $this->logger->error("Auto-disabled skill '{$skillName}' after {$failures} consecutive failures");

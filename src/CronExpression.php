@@ -12,11 +12,13 @@
  *   1-5      range
  *   * /15     every 15 (step)
  *   1-5/2    range with step
+ *   @manual  never on a timer: runs only when next_run_at is set by hand ("run now")
  */
 
 class CronExpression
 {
     private array $fields; // [minutes, hours, dom, month, dow]
+    private bool $manual = false;
 
     private const FIELD_RANGES = [
         [0, 59],   // minute
@@ -28,6 +30,11 @@ class CronExpression
 
     public function __construct(string $expression)
     {
+        if (trim($expression) === '@manual') {
+            $this->manual = true;
+            $this->fields = [];
+            return;
+        }
         $parts = preg_split('/\s+/', trim($expression));
         if (count($parts) !== 5) {
             throw new InvalidArgumentException("Cron expression must have 5 fields, got " . count($parts) . ": {$expression}");
@@ -40,10 +47,11 @@ class CronExpression
     }
 
     /**
-     * Calculate the next run time after the given DateTime.
+     * Calculate the next run time after the given DateTime (null for @manual).
      */
-    public function nextRunAfter(DateTime $after): DateTime
+    public function nextRunAfter(DateTime $after): ?DateTime
     {
+        if ($this->manual) return null;   // on demand only
         $dt = clone $after;
         $dt->modify('+1 minute');
         $dt->setTime((int)$dt->format('G'), (int)$dt->format('i'), 0);
@@ -75,6 +83,7 @@ class CronExpression
      */
     public function describe(): string
     {
+        if ($this->manual) return 'on demand';
         $parts = [];
 
         // Time
