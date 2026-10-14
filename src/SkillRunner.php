@@ -51,6 +51,9 @@ class SkillRunner
         $maxTurns  = $overrides['max_turns']       ?? $skillDefaults['max-turns'] ?? 10;
         $budget    = $overrides['max_budget_usd']  ?? $skillDefaults['max-budget'] ?? 2.00;
         $effort    = $overrides['effort']          ?? $skillDefaults['effort'] ?? 'high';
+        // `chrome: true` in the frontmatter gives the run the Claude in Chrome browser tools (claude --chrome);
+        // the user's Chrome must be open with the extension connected
+        $chrome    = strtolower((string)($skillDefaults['chrome'] ?? '')) === 'true';
 
         // Build the prompt. Avoid the word "skill" — Claude Code has a built-in Skill tool
         // that intercepts "run the X skill" phrasing and tries to look X up in its native
@@ -59,7 +62,8 @@ class SkillRunner
         $day = date('l');
         $prompt = "The system prompt above contains a complete task called `{$skillName}` with "
                 . "numbered steps. Work through those steps yourself, right now, using the tools "
-                . "available (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch). Do NOT "
+                . "available (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch"
+                . ($chrome ? ", and the Claude in Chrome browser tools" : "") . "). Do NOT "
                 . "attempt to invoke `{$skillName}` as a Claude Code Skill tool — it is NOT one. "
                 . "It is a set of instructions you execute directly. Today is {$day}, {$date}.";
         if ($arguments !== '') {
@@ -117,7 +121,8 @@ class SkillRunner
             . ' --max-turns ' . (int)$maxTurns
             . ' --output-format json'
             . ' --dangerously-skip-permissions'
-            . ' --append-system-prompt-file ' . escapeshellarg($this->normalizePath($tempFile));
+            . ' --append-system-prompt-file ' . escapeshellarg($this->normalizePath($tempFile))
+            . ($chrome ? ' --chrome' : '');
 
         // Note: intentionally NOT using --add-dir. Skills should access only
         // what they need via explicit paths or commands in their SKILL.md.
