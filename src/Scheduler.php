@@ -326,6 +326,7 @@ class Scheduler
      * Write a row to an external usage_log table for cost tracking. Opt-in via
      * config.usage_log.enabled. The target DB and table are configurable —
      * connection details fall back to the main db.* config if not overridden.
+     * usage_log.driver: 'mysql' (default) or 'pgsql' (then usage_log.schema is the search path).
      *
      * The target table must have columns matching the INSERT below:
      *   timestamp, provider, model, task_type, cron_job_name, description,
@@ -358,11 +359,17 @@ class Scheduler
             return;
         }
 
+        $pg = ($cfg['driver'] ?? 'mysql') === 'pgsql';
         try {
-            $dsn = "mysql:host={$host};port={$port};dbname={$dbName};charset=utf8mb4";
+            $dsn = $pg ? "pgsql:host={$host};port={$port};dbname={$dbName}"
+                       : "mysql:host={$host};port={$port};dbname={$dbName};charset=utf8mb4";
             $aDb = new \PDO($dsn, $user, $pass, [
                 \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
             ]);
+            if ($pg && !empty($cfg['schema']) && preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $cfg['schema'])) {
+                $aDb->exec("SET search_path TO {$cfg['schema']}");
+            }
+            $q = $pg ? '"' : '`';
 
             $taskType = match($triggerType) {
                 'schedule'  => 'cron_skill',
@@ -381,7 +388,7 @@ class Scheduler
             }
 
             $stmt = $aDb->prepare("
-                INSERT INTO `{$table}`
+                INSERT INTO {$q}{$table}{$q}
                     (timestamp, provider, model, task_type, cron_job_name, description,
                      tokens_in, tokens_out, cache_read, cache_write, cost_usd, session_id)
                 VALUES (NOW(), 'anthropic', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
